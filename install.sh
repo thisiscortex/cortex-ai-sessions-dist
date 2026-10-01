@@ -608,6 +608,20 @@ POCKET_MODEL_ROOT="$HOME/.cortex-ai-sessions/voice-tts/pocket-model"
 POCKET_MODEL_SHA256="473f47d99560bd50eb8b4509d3cacfe7f316ab20bdca86505403a2e6a936a6e9"
 POCKET_TOKENIZER_SHA256="d461765ae179566678c93091c5fa6f2984c31bbe990bf1aa62d92c64d91bc3f6"
 
+# Locks shared with the running app (see the managed CLI update section below).
+# Defined here because the EXIT trap releases them, and the trap can fire long
+# before the updaters that take them are reached. Derived from DATA_DIR at call
+# time, which the in-app update path re-resolves after the support swap.
+cli_update_lock_dir() {
+  printf '%s' "${DATA_DIR:-}/cli-update-locks"
+}
+
+release_cli_update_locks() {
+  [ -n "${DATA_DIR:-}" ] || return 0
+  rm -rf "$(cli_update_lock_dir)" 2>/dev/null || true
+  return 0
+}
+
 WORK="$(mktemp -d)"
 cleanup() {
   local rc=$?
@@ -625,6 +639,7 @@ cleanup() {
     relaunch_installed_app || true
   fi
   rm -rf "$WORK"
+  release_cli_update_locks
   exit "$rc"
 }
 trap cleanup EXIT
@@ -715,6 +730,21 @@ dl() {
   fi
 }
 
+# Download both independent update artifacts while the old app stays usable.
+# Wait for BOTH children even after a failure, so cleanup never removes WORK
+# underneath an active transfer. dl retains its local/public/token branches,
+# resume/retry behavior, and the artifact-specific failure message in the log.
+download_update_assets() {
+  local app_pid support_pid app_status=0 support_status=0
+  dl "$APP_ZIP" "$WORK/$APP_ZIP" &
+  app_pid=$!
+  dl "$SUPPORT_TAR" "$WORK/$SUPPORT_TAR" &
+  support_pid=$!
+  wait "$app_pid" || app_status=$?
+  wait "$support_pid" || support_status=$?
+  [ "$app_status" -eq 0 ] && [ "$support_status" -eq 0 ]
+}
+
 # dl_pocket_model <dest> — Pocket's immutable public release is deliberately
 # separate from each Cortex app release. This keeps the large weight asset out
 # of app updates while the pinned release asset and file checksums keep the
@@ -739,7 +769,7 @@ dl_pocket_model() {
 
 # ── Prepare update assets while the old app remains usable ───────────────
 step "Preparing update assets"
-dl "$APP_ZIP" "$WORK/$APP_ZIP"
+download_update_assets || exit 1
 ok "downloaded $APP_ZIP"
 ditto -x -k "$WORK/$APP_ZIP" "$WORK/app" || die "could not unzip $APP_ZIP"
 SRC_APP="$(find "$WORK/app" -maxdepth 2 -name '*.app' -type d | head -n1)"
@@ -756,7 +786,6 @@ if [ -z "${CORTEX_DATA_DIR:-}" ]; then
   CONFIG="$DATA_DIR.env"
   mkdir -p "$DATA_DIR"
 fi
-dl "$SUPPORT_TAR" "$WORK/$SUPPORT_TAR"
 mkdir -p "$WORK/support"
 tar -xzf "$WORK/$SUPPORT_TAR" -C "$WORK/support" || die "could not extract $SUPPORT_TAR"
 ok "prepared app + support files"
@@ -841,6 +870,7 @@ pocket_release_model_ready() {
     && pocket_file_matches "$POCKET_MODEL_ROOT/tokenizer.model" "$POCKET_TOKENIZER_SHA256"
 }
 
+if [ "${CORTEX_INSTALL_LOCAL_VOICE:-0}" = "1" ]; then
 step "Pocket voice model"
 if pocket_release_model_ready; then
   ok "verified Pocket model already installed"
@@ -867,6 +897,7 @@ else
     || die "could not install the verified Pocket model"
   chmod 600 "$POCKET_MODEL_ROOT/model.safetensors" "$POCKET_MODEL_ROOT/tokenizer.model" 2>/dev/null || true
   ok "downloaded and verified Pocket model"
+fi
 fi
 
 # ── Bun (required for Node deps + the bot) ──────────────
@@ -900,7 +931,7 @@ refresh_grok_cli_home
   CORTEX_RELEASE_INSTALL=1 \
   CORTEX_DATA_DIR="$DATA_DIR" \
   CORTEX_VOICE_TTS_BUNDLED_ASSET_DIR="$APP_PATH/Contents/Resources/standalone/scripts/voice-assets" \
-  bash setup.command ) || warn "setup.command reported problems (see above)"
+  bash setup.command ) || die "setup.command failed; support runtime was not activated (see above)"
 restore_preserved_config_lines "$PRESERVED_CONFIG_BACKUP"
 load_cli_overrides_from_config
 refresh_grok_cli_home
@@ -910,6 +941,7 @@ refresh_grok_cli_home
 # then installs OpenAI Whisper in the same managed runtime if MLX's package or
 # Hugging Face model cannot be prepared. A speech failure must not prevent the
 # text application from installing; Live voice exposes the same repair action.
+if [ "${CORTEX_INSTALL_LOCAL_VOICE:-0}" = "1" ]; then
 step "Realtime speech model"
 STT_RUNTIME_DIR="$HOME/Library/Application Support/Cortex/voice-stt"
 STT_PROVISIONER="$APP_PATH/Contents/Resources/standalone/scripts/provision-realtime-stt.sh"
@@ -1054,12 +1086,56 @@ elif CORTEX_STT_ENGINE="$STT_ENGINE" bash "$STT_PROVISIONER" \
 else
   warn "local speech provisioning failed; Cortex installed and Live voice can retry from the app"
 fi
+fi
 
 # ── Managed local CLI updates ───────────────────────────
 # A rerunnable Cortex installer is an explicit request to bring the local
 # providers it owns to their current stable releases. Never replace a CLI that
 # was selected via an explicit *_BIN override or that lives outside the vendor
 # and npm locations recognised below: those are user-managed installations.
+#
+# During an app self-update these run after the relaunch, so Cortex is live and
+# a user can start a turn at any moment. Two guards keep that safe, and the
+# order between them matters:
+#
+#   1. Take the lock FIRST. Cortex reads this directory in
+#      isCliUpdateRunningForProvider() and refuses to start a turn on a locked
+#      provider, so nothing new can begin once the lock exists.
+#   2. THEN check whether the CLI is already running. Doing it in this order
+#      leaves no window where a turn starts between the check and the swap.
+#
+# A CLI that is in use is left alone entirely: a stale binary is a much smaller
+# problem than one replaced underneath a running turn, and About can update it
+# later. The lock records this installer's pid so a crash cannot block chat.
+
+# Is the provider's executable running right now? Matches the resolved path
+# (what Cortex actually spawns) and the bare executable name, so a CLI started
+# from a terminal counts too — that is also a process we must not disturb.
+cli_provider_is_running() {
+  local name="$1" bin="$2"
+  pgrep -x "$name" >/dev/null 2>&1 && return 0
+  [ -n "$bin" ] && pgrep -f "$bin" >/dev/null 2>&1 && return 0
+  return 1
+}
+
+# Run one provider's updater behind both guards. Never returns non-zero: a
+# locked, busy, or failing CLI must not abort the rest of the installer.
+run_guarded_cli_update() {
+  local key="$1" updater="$2" name="$3" label="$4" dir bin
+  dir="$(cli_update_lock_dir)"
+  mkdir -p "$dir" 2>/dev/null || true
+  printf '%s\n' "$$" > "$dir/$key" 2>/dev/null || true
+  bin="$(command -v "$name" 2>/dev/null || true)"
+  if cli_provider_is_running "$name" "$bin"; then
+    step "$label"
+    warn "$label is running right now — leaving it untouched; update it from About when it is idle"
+    rm -f "$dir/$key" 2>/dev/null || true
+    return 0
+  fi
+  "$updater" || warn "$label update step failed — keeping the existing CLI"
+  rm -f "$dir/$key" 2>/dev/null || true
+  return 0
+}
 
 update_claude_cli() {
   local bin
@@ -1210,15 +1286,17 @@ update_grok_cli() {
   show_cli_version "grok" "$bin"
 }
 
-if [ "$IN_APP_UPDATE" = "1" ]; then
-  step "Provider CLI updates"
-  ok "skipped during app self-update; provider updates remain explicit in About"
-else
-  update_claude_cli
-  update_codex_cli
-  update_agy_cli
-  update_grok_cli
-fi
+# A self-update runs these too: the app update flow owns the provider CLIs, so
+# an updated Cortex never leaves the tools it drives a release behind. Each
+# updater is already warn-on-failure internally, and the `|| warn` guard also
+# clears errexit inside it, so one vendor installer failing can never abort the
+# rest of the update (dependencies, voice runtime, relaunch failsafe).
+step "Provider CLI updates"
+run_guarded_cli_update claude update_claude_cli claude "Claude CLI"
+run_guarded_cli_update codex update_codex_cli codex "Codex CLI"
+run_guarded_cli_update antigravity update_agy_cli agy "Antigravity CLI"
+run_guarded_cli_update grok update_grok_cli grok "Grok CLI"
+release_cli_update_locks
 
 # ── Computer-control MCP server (mouse / keyboard / screen) ─
 # Cortex injects this MCP server per opted-in session. Do not register it at
@@ -1257,41 +1335,34 @@ else
   warn "Grant Accessibility + Screen Recording to the app (System Settings → Privacy & Security) for mouse/screen control."
 fi
 
-# ── Obsidian MCP server (vault read/write for agent sessions) ─
-# Cortex injects this MCP server per opted-in session (composer "Obsidian"
-# toggle). Do not register it at user/global CLI scope here; remove stale
-# global registrations from older setups, then run the live server selftest.
-step "Obsidian MCP server"
-OBSIDIAN_MCP_SERVER="$DATA_DIR/scripts/obsidian-mcp/server.mjs"
-if [ ! -f "$OBSIDIAN_MCP_SERVER" ]; then
-  warn "server.mjs not in support bundle — skipping Obsidian MCP selftest"
+# ── Obsidian skills (vault access for agent sessions) ─
+# The composer "Obsidian" toggle uses the vendored kepano/obsidian-skills.
+# Claude loads them per session via --plugin-dir; Codex only reads skills from
+# CODEX_HOME, so install them there. Also remove the global `obsidian` MCP
+# registrations older setups created.
+step "Obsidian skills"
+OBSIDIAN_SKILLS_INSTALLER="$DATA_DIR/scripts/obsidian-skills/install.mjs"
+if [ ! -f "$OBSIDIAN_SKILLS_INSTALLER" ]; then
+  warn "obsidian-skills not in support bundle — skipping Obsidian skills install"
 else
   if command -v claude >/dev/null 2>&1; then
     claude mcp remove -s user obsidian >/dev/null 2>&1 || true
     claude mcp remove -s local obsidian >/dev/null 2>&1 || true
-    ok "removed stale Claude obsidian registration"
-  else
-    warn "claude CLI missing — skipped stale Claude registration cleanup"
   fi
   if command -v codex >/dev/null 2>&1; then
     codex mcp remove obsidian >/dev/null 2>&1 || true
-    ok "removed stale Codex obsidian registration"
+  fi
+  if "$MCP_NODE" "$OBSIDIAN_SKILLS_INSTALLER" "${CODEX_HOME:-$HOME/.codex}/skills" >/dev/null 2>&1; then
+    ok "Obsidian skills installed for Codex"
   else
-    warn "codex CLI missing — skipped stale Codex registration cleanup"
+    warn "could not install Obsidian skills into ${CODEX_HOME:-$HOME/.codex}/skills"
   fi
   if ! command -v obsidian >/dev/null 2>&1; then
     warn "obsidian CLI not found — install Obsidian ≥1.12 and enable it (Settings → General → Command line interface)"
+  elif obsidian vaults >/dev/null 2>&1; then
+    ok "obsidian CLI reachable"
   else
-    OBSIDIAN_MCP_SELFTEST="$DATA_DIR/scripts/obsidian-mcp/selftest.mjs"
-    if [ -f "$OBSIDIAN_MCP_SELFTEST" ]; then
-      if "$MCP_NODE" "$OBSIDIAN_MCP_SELFTEST" "$OBSIDIAN_MCP_SERVER" >/dev/null 2>&1; then
-        ok "Obsidian MCP selftest passed"
-      else
-        warn "Obsidian MCP selftest failed — the Obsidian app must be running with a vault open"
-      fi
-    else
-      warn "selftest.mjs missing — could not verify live Obsidian tool calls"
-    fi
+    warn "obsidian CLI could not reach the app — Obsidian must be running when a session uses it"
   fi
 fi
 

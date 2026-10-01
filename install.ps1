@@ -587,15 +587,30 @@ try {
   Ok "installed -> $INSTALL_DIR"
 
   # Start Menu + Desktop shortcuts.
+  $displayName = $APP_NAME
+  $profilePath = Join-Path $INSTALL_DIR 'resources\product-profile.json'
+  if (Test-Path $profilePath) {
+    try {
+      $profile = Get-Content $profilePath -Raw | ConvertFrom-Json
+      if ($profile.marketingName) { $displayName = [string]$profile.marketingName }
+    } catch { Warn 'could not read packaged display name; using executable name for shortcuts' }
+  }
   $ws = New-Object -ComObject WScript.Shell
   $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
   foreach ($lnkDir in @($startMenu, [Environment]::GetFolderPath('Desktop'))) {
     try {
-      $lnk = $ws.CreateShortcut((Join-Path $lnkDir "$APP_NAME.lnk"))
+      $lnk = $ws.CreateShortcut((Join-Path $lnkDir "$displayName.lnk"))
       $lnk.TargetPath = $APP_EXE
       $lnk.WorkingDirectory = $INSTALL_DIR
       $lnk.IconLocation = $APP_EXE
       $lnk.Save()
+      if ($displayName -ne $APP_NAME) {
+        $oldPath = Join-Path $lnkDir "$APP_NAME.lnk"
+        if (Test-Path $oldPath) {
+          $oldShortcut = $ws.CreateShortcut($oldPath)
+          if ($oldShortcut.TargetPath -eq $APP_EXE) { Remove-Item $oldPath -Force }
+        }
+      }
     } catch {}
   }
   Ok 'created Start Menu + Desktop shortcuts'
@@ -625,6 +640,7 @@ try {
   # The model stays a distinct, versioned GitHub Release asset. It is not part
   # of the app archive or Git history; exact SHA-256 checks gate installation
   # and Pocket runs offline after this point.
+  if ($env:CORTEX_INSTALL_LOCAL_VOICE -eq '1') {
   Step 'Pocket voice model'
   $pocketModelDir = Join-Path $DATA_DIR 'voice-tts\pocket-model'
   if (Test-PocketReleaseModel -Directory $pocketModelDir) {
@@ -660,6 +676,7 @@ try {
       Die 'could not install the verified Pocket model'
     }
     Ok 'downloaded and verified Pocket model'
+  }
   }
 
   # -- Bun (powers the WhatsApp bot + data-dir Node deps) --------------------
@@ -898,30 +915,31 @@ try {
     } else { Warn 'selftest.mjs missing - could not verify live computer-control tool calls' }
   }
 
-  # -- Obsidian MCP server (vault read/write for agent sessions) -------------
-  Step 'Obsidian MCP server'
-  $obsidianMcpServer = Join-Path $DATA_DIR 'scripts\obsidian-mcp\server.mjs'
-  if (-not (Test-Path $obsidianMcpServer)) {
-    Warn 'server.mjs not in support bundle - skipping Obsidian MCP selftest'
+  # -- Obsidian skills (vault access for agent sessions) ---------------------
+  # Claude loads the vendored kepano/obsidian-skills per session; Codex reads
+  # skills only from CODEX_HOME. Also remove stale global MCP registrations.
+  Step 'Obsidian skills'
+  $obsidianSkillsInstaller = Join-Path $DATA_DIR 'scripts\obsidian-skills\install.mjs'
+  if (-not (Test-Path $obsidianSkillsInstaller)) {
+    Warn 'obsidian-skills not in support bundle - skipping Obsidian skills install'
   } else {
     if (Get-Command claude -ErrorAction SilentlyContinue) {
       try { & claude mcp remove -s user obsidian 2>$null | Out-Null } catch {}
       try { & claude mcp remove -s local obsidian 2>$null | Out-Null } catch {}
-      Ok 'removed stale Claude obsidian registration'
-    } else { Warn 'claude CLI missing - skipped stale Claude registration cleanup' }
+    }
     if (Get-Command codex -ErrorAction SilentlyContinue) {
       try { & codex mcp remove obsidian 2>$null | Out-Null } catch {}
-      Ok 'removed stale Codex obsidian registration'
-    } else { Warn 'codex CLI missing - skipped stale Codex registration cleanup' }
+    }
+    $codexHomeDir = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+    & $nodeCmd $obsidianSkillsInstaller (Join-Path $codexHomeDir 'skills') 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) { Ok 'Obsidian skills installed for Codex' }
+    else { Warn "could not install Obsidian skills into $codexHomeDir\skills" }
     if (-not (Get-Command obsidian -ErrorAction SilentlyContinue)) {
       Warn 'obsidian CLI not found - install Obsidian >=1.12 and enable it (Settings > General > Command line interface)'
     } else {
-      $obsidianSelftest = Join-Path $DATA_DIR 'scripts\obsidian-mcp\selftest.mjs'
-      if (Test-Path $obsidianSelftest) {
-        & $nodeCmd $obsidianSelftest $obsidianMcpServer 2>$null | Out-Null
-        if ($LASTEXITCODE -eq 0) { Ok 'Obsidian MCP selftest passed' }
-        else { Warn 'Obsidian MCP selftest failed - the Obsidian app must be running with a vault open' }
-      } else { Warn 'selftest.mjs missing - could not verify live Obsidian tool calls' }
+      & obsidian vaults 2>$null | Out-Null
+      if ($LASTEXITCODE -eq 0) { Ok 'obsidian CLI reachable' }
+      else { Warn 'obsidian CLI could not reach the app - Obsidian must be running when a session uses it' }
     }
   }
 
