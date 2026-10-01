@@ -1390,7 +1390,7 @@ echo
 ok "Install complete."
 echo
 echo "  Launch the app:   open \"$APP_PATH\""
-echo "  WhatsApp bot:     open \"$DATA_DIR/start-bot.command\""
+echo "  WhatsApp bot:     install WhatsApp Accountant from the Cortex App Store"
 echo "  Shared state:     $DATA_DIR  (settings.json, sessions.json)"
 echo "  Install log:      $LOG_FILE"
 echo

@@ -979,7 +979,7 @@ Write-Host ""
 Ok 'Install complete.'
 Write-Host ""
 Write-Host "  Launch the app:   $APP_EXE"
-Write-Host "  WhatsApp bot:     $DATA_DIR\start-bot.cmd"
+Write-Host "  WhatsApp bot:     install WhatsApp Accountant from the Cortex App Store"
 Write-Host "  Shared state:     $DATA_DIR  (settings.json, sessions.json)"
 Write-Host ""
 try { Start-Process $APP_EXE } catch {}
