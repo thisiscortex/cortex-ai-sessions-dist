@@ -686,6 +686,37 @@ function Remove-InstallerDuplicateSetupHook {
   }
 }
 
+function Invoke-ComputerControlSelftest {
+  param([string]$NodePath, [string]$SelftestPath, [string]$ServerPath)
+  $savedErrorPreference = $ErrorActionPreference
+  $output = @()
+  $exitCode = 127
+  try {
+    $nodeExe = (Get-Command $NodePath -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+    # Windows PowerShell 5.1 turns redirected native stderr into ErrorRecords.
+    # Capture these as diagnostic text for this optional check, then restore
+    # the caller's policy before deciding success from the process exit code.
+    $ErrorActionPreference = 'Continue'
+    $output = @(& $nodeExe $SelftestPath --node $nodeExe --server $ServerPath 2>&1)
+    $exitCode = $LASTEXITCODE
+    if ($null -eq $exitCode -or @($output | Where-Object {
+      $_ -is [Management.Automation.ErrorRecord] -and $_.FullyQualifiedErrorId -eq 'NativeCommandFailed'
+    }).Count) { $exitCode = 127 }
+  } catch {
+    $output += $_.Exception.Message
+  } finally {
+    $ErrorActionPreference = $savedErrorPreference
+  }
+  Write-Host "  computer-control Node: $NodePath"
+  foreach ($line in $output) { Write-Host ("  {0}" -f [string]$line) }
+  if ($exitCode -eq 0) {
+    Ok 'computer-control selftest passed'
+    return $true
+  }
+  Warn "computer-control selftest failed (code $exitCode) - continuing app installation; Computer tools need attention. See the diagnostic output above."
+  return $false
+}
+
 try {
   # -- Install the app -------------------------------------------------------
   Step "Installing $APP_NAME"
@@ -1040,9 +1071,7 @@ try {
     } else { Warn 'codex CLI missing - skipped stale Codex registration cleanup' }
     $selftest = Join-Path $DATA_DIR 'scripts\computer-mcp\selftest.mjs'
     if (Test-Path $selftest) {
-      & $nodeCmd $selftest --node $nodeCmd --server $mcpServer 2>$null | Out-Null
-      if ($LASTEXITCODE -eq 0) { Ok 'computer-control selftest passed' }
-      else { Warn 'computer-control selftest failed - live tool calls need attention' }
+      [void](Invoke-ComputerControlSelftest -NodePath $nodeCmd -SelftestPath $selftest -ServerPath $mcpServer)
     } else { Warn 'selftest.mjs missing - could not verify live computer-control tool calls' }
   }
 
