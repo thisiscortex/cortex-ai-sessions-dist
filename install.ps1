@@ -41,6 +41,7 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::S
 $REPO        = 'appfactory123/claude-sessions'
 $PUBLIC_REPO = if ($env:CORTEX_PUBLIC_REPO) { $env:CORTEX_PUBLIC_REPO } else { 'appfactory123/cortex-ai-sessions-dist' }
 $APP_NAME    = 'Cortex'
+$APP_USER_MODEL_ID = 'com.local.cortex'
 $INSTALL_DIR = Join-Path $env:LOCALAPPDATA 'Programs\Cortex'
 $APP_EXE     = Join-Path $INSTALL_DIR "$APP_NAME.exe"
 $DATA_DIR    = if ($env:CORTEX_DATA_DIR) { [System.IO.Path]::GetFullPath($env:CORTEX_DATA_DIR) } else { Join-Path $env:USERPROFILE '.cortex-ai-sessions' }
@@ -62,8 +63,10 @@ if ($installerProfilePath) {
   $installerProfile = Get-Content -LiteralPath $installerProfilePath -Raw | ConvertFrom-Json
   if ($installerProfile.id -notin @('cortex', 'w3i') -or
       $installerProfile.productName -notmatch '^[A-Za-z0-9 ]+$' -or
+      $installerProfile.appId -notmatch '^[A-Za-z0-9][A-Za-z0-9.-]{0,127}$' -or
       $installerProfile.stateDirectoryName -notmatch '^\.[A-Za-z0-9-]+$') { throw 'Invalid installer product profile.' }
   $APP_NAME = $installerProfile.productName
+  $APP_USER_MODEL_ID = $installerProfile.appId
   $PUBLIC_REPO = if ($env:CORTEX_PUBLIC_REPO) { $env:CORTEX_PUBLIC_REPO } else { $installerProfile.release.distributionRepository }
   $INSTALL_DIR = Join-Path $env:LOCALAPPDATA "Programs\$APP_NAME"
   $APP_EXE = Join-Path $INSTALL_DIR "$APP_NAME.exe"
@@ -686,6 +689,63 @@ function Remove-InstallerDuplicateSetupHook {
   }
 }
 
+function Register-InstallerNotificationAppId {
+  param([string]$AppId, [string]$DisplayName)
+  if ($AppId -notmatch '^[A-Za-z0-9][A-Za-z0-9.-]{0,127}$' -or [string]::IsNullOrWhiteSpace($DisplayName)) { throw 'Invalid notification app identity.' }
+  $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Software\Classes\AppUserModelId\' + $AppId)
+  try { $key.SetValue('DisplayName', $DisplayName, [Microsoft.Win32.RegistryValueKind]::String) }
+  finally { $key.Dispose() }
+}
+
+function Set-InstallerShortcutAppId {
+  param([string]$ShortcutPath, [string]$AppId)
+  if ($AppId -notmatch '^[A-Za-z0-9][A-Za-z0-9.-]{0,127}$' -or
+      [IO.Path]::GetExtension($ShortcutPath) -ne '.lnk') { throw 'Invalid notification shortcut identity.' }
+  if (-not ('CortexShortcutIdentity' -as [type])) {
+    # WScript.Shell cannot set System.AppUserModel.ID. Use the existing link's
+    # property store; never touch Windows notification preferences or policies.
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+public static class CortexShortcutIdentity {
+  [StructLayout(LayoutKind.Sequential)]
+  private struct PropertyKey { public Guid Format; public uint Id; }
+  [StructLayout(LayoutKind.Sequential)]
+  private struct PropVariant {
+    public ushort Type, Reserved1, Reserved2, Reserved3;
+    public IntPtr Text, Spare;
+  }
+  [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  private interface IPropertyStore {
+    [PreserveSig] int GetCount(out uint count);
+    [PreserveSig] int GetAt(uint index, out PropertyKey key);
+    [PreserveSig] int GetValue(ref PropertyKey key, out PropVariant value);
+    [PreserveSig] int SetValue(ref PropertyKey key, ref PropVariant value);
+    [PreserveSig] int Commit();
+  }
+  [DllImport("ole32.dll")] private static extern int PropVariantClear(ref PropVariant value);
+  public static void Set(string shortcut, string appId) {
+    object link = Activator.CreateInstance(Type.GetTypeFromCLSID(new Guid("00021401-0000-0000-C000-000000000046")));
+    try {
+      var file = (IPersistFile)link;
+      file.Load(shortcut, 2);
+      var store = (IPropertyStore)link;
+      var key = new PropertyKey { Format = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), Id = 5 };
+      var value = new PropVariant { Type = 31, Text = Marshal.StringToCoTaskMemUni(appId) };
+      try {
+        Marshal.ThrowExceptionForHR(store.SetValue(ref key, ref value));
+        Marshal.ThrowExceptionForHR(store.Commit());
+        file.Save(shortcut, true);
+      } finally { PropVariantClear(ref value); }
+    } finally { if (Marshal.IsComObject(link)) Marshal.FinalReleaseComObject(link); }
+  }
+}
+'@
+  }
+  [CortexShortcutIdentity]::Set([IO.Path]::GetFullPath($ShortcutPath), $AppId)
+}
+
 function Invoke-ComputerControlSelftest {
   param([string]$NodePath, [string]$SelftestPath, [string]$ServerPath)
   $savedErrorPreference = $ErrorActionPreference
@@ -751,9 +811,11 @@ try {
     try {
       $profile = Get-Content $profilePath -Raw | ConvertFrom-Json
       if ($profile.marketingName) { $displayName = [string]$profile.marketingName }
+      if ($profile.appId -match '^[A-Za-z0-9][A-Za-z0-9.-]{0,127}$') { $APP_USER_MODEL_ID = [string]$profile.appId }
     } catch { Warn 'could not read packaged display name; using executable name for shortcuts' }
   }
   $ws = New-Object -ComObject WScript.Shell
+  $notificationIdentityReady = $true
   $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
   foreach ($lnkDir in @($startMenu, [Environment]::GetFolderPath('Desktop'))) {
     try {
@@ -762,6 +824,7 @@ try {
       $lnk.WorkingDirectory = $INSTALL_DIR
       $lnk.IconLocation = $APP_EXE
       $lnk.Save()
+      Set-InstallerShortcutAppId -ShortcutPath (Join-Path $lnkDir "$displayName.lnk") -AppId $APP_USER_MODEL_ID
       if ($displayName -ne $APP_NAME) {
         $oldPath = Join-Path $lnkDir "$APP_NAME.lnk"
         if (Test-Path $oldPath) {
@@ -769,9 +832,12 @@ try {
           if ($oldShortcut.TargetPath -eq $APP_EXE) { Remove-Item $oldPath -Force }
         }
       }
-    } catch {}
+    } catch { $notificationIdentityReady = $false; Warn ("could not register shortcut notifications: " + $_.Exception.Message) }
   }
-  Ok 'created Start Menu + Desktop shortcuts'
+  try { Register-InstallerNotificationAppId -AppId $APP_USER_MODEL_ID -DisplayName $displayName }
+  catch { $notificationIdentityReady = $false; Warn ("could not register Windows notification identity: " + $_.Exception.Message) }
+  if ($notificationIdentityReady) { Ok 'created Start Menu + Desktop shortcuts with product notification identity' }
+  else { Warn 'notification shortcut registration was incomplete; the packaged app will retry its Start Menu identity' }
 
   $vf = Join-Path $INSTALL_DIR 'resources\standalone\version.json'
   if (Test-Path $vf) {
