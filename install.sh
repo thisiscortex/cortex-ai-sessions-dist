@@ -498,22 +498,105 @@ ensure_local_bin_link() {
     || warn "could not link $name into $LOCAL_BIN — sign-in may fail with ENOENT"
 }
 
-# Ensure Node.js + npm are available.
+# ── Runtime health (Bun + Node) ─────────────────────────
+# `command -v` only proves that a file exists. A Bun or Node left behind by
+# another installer can still be broken: built for the other CPU, an AVX2 Bun
+# on an older Intel Mac, a truncated download, or too old to read the support
+# bundle's text bun.lock. Run each candidate before trusting it.
+BUN_MIN_MAJOR=1
+BUN_MIN_MINOR=2
+NODE_MIN_MAJOR=20
+# Bun pinned to the release toolchain. The SHA-256 values are fixed here rather
+# than fetched beside the archive. x64 uses Bun's baseline build because the
+# default build needs AVX2, which older Intel Macs lack.
+BUN_PINNED_TAG="bun-v1.3.14"
+BUN_DARWIN_ARM64_SHA256="d8b96221828ad6f97ac7ac0ab7e95872341af763001e8803e8267652c2652620"
+BUN_DARWIN_X64_BASELINE_SHA256="3e35ad6f53971a9834bf9e6786e2adf72b5f1921cc9a9c5fde073d2972944076"
+BUN_BIN=""
+NODE_BIN=""
+
+# Succeeds only when $1 is an executable Bun >= 1.2 that can run JavaScript.
+bun_works() {
+  [ -n "$1" ] && [ -x "$1" ] || return 1
+  "$1" -e "const [a,b]=Bun.version.split('.').map(Number);process.exit(a>$BUN_MIN_MAJOR||(a===$BUN_MIN_MAJOR&&b>=$BUN_MIN_MINOR)?0:1)" >/dev/null 2>&1
+}
+
+# Succeeds only when $1 is an executable Node >= 20 whose sibling npm runs.
+# Homebrew, nodejs.org, nvm and fnm all install npm beside node.
+node_works() {
+  [ -n "$1" ] && [ -x "$1" ] || return 1
+  "$1" -e "process.exit(Number(process.versions.node.split('.')[0])>=$NODE_MIN_MAJOR?0:1)" >/dev/null 2>&1 || return 1
+  # npm is a `#!/usr/bin/env node` script, so probe it with this node first on PATH.
+  [ -x "$(dirname "$1")/npm" ] && PATH="$(dirname "$1"):$PATH" "$(dirname "$1")/npm" --version >/dev/null 2>&1
+}
+
+# The first working candidate wins: the login-shell PATH entry first, then the
+# copies a Cortex install manages. Prints its path.
+find_working_bun() {
+  local candidate
+  for candidate in "$(command -v bun 2>/dev/null || true)" "$HOME/.bun/bin/bun"; do
+    bun_works "$candidate" && { printf '%s\n' "$candidate"; return 0; }
+  done
+  return 1
+}
+
+find_working_node() {
+  local candidate
+  for candidate in "$(command -v node 2>/dev/null || true)" "$LOCAL_BIN/node" /opt/homebrew/bin/node /usr/local/bin/node; do
+    node_works "$candidate" && { printf '%s\n' "$candidate"; return 0; }
+  done
+  return 1
+}
+
+# Install the pinned Bun into ~/.bun/bin, replacing a broken copy there.
+install_verified_bun() {
+  local asset sum tmp rc
+  case "$ARCH" in
+    arm64) asset="bun-darwin-aarch64.zip"; sum="$BUN_DARWIN_ARM64_SHA256" ;;
+    x64)   asset="bun-darwin-x64-baseline.zip"; sum="$BUN_DARWIN_X64_BASELINE_SHA256" ;;
+    *) return 1 ;;
+  esac
+  tmp="$(mktemp -d)" || return 1
+  if ! retry 3 curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 30 \
+       "https://github.com/oven-sh/bun/releases/download/${BUN_PINNED_TAG}/${asset}" -o "$tmp/$asset"; then
+    rm -rf "$tmp"; return 1
+  fi
+  if [ "$(shasum -a 256 "$tmp/$asset" | awk '{print $1}')" != "$sum" ]; then
+    warn "Bun download failed SHA-256 verification"
+    rm -rf "$tmp"; return 1
+  fi
+  rc=1
+  if ditto -x -k "$tmp/$asset" "$tmp/x" && bun_works "$tmp/x/${asset%.zip}/bun" \
+     && mkdir -p "$HOME/.bun/bin" \
+     && install -m 755 "$tmp/x/${asset%.zip}/bun" "$HOME/.bun/bin/bun.cortex-new" \
+     && mv -f "$HOME/.bun/bin/bun.cortex-new" "$HOME/.bun/bin/bun"; then
+    ln -sf bun "$HOME/.bun/bin/bunx" 2>/dev/null || true
+    rc=0
+  fi
+  rm -rf "$tmp"
+  return "$rc"
+}
+
+# Ensure a working Node.js + npm (sets NODE_BIN and puts it first on PATH).
 #
 # The Claude/Codex CLIs the bot drives are installed via `npm install -g`, and
-# the app's MCP servers run on `node`. A machine with no Node has no npm, so
-# those steps were silently skipped ("npm unavailable") and sign-in then failed.
-# Install Node without assuming any package manager: prefer Homebrew when it's
-# present, otherwise drop the official Node LTS build into ~/.local (its bin dir
-# is already on PATH and is the app's CLI fallback root). Depends on $ARCH, so
-# call this only after Preflight has set it.
+# the app's MCP servers run on `node` (registered by absolute path below). A
+# missing or broken Node used to skip those steps silently ("npm unavailable"),
+# and sign-in then failed. Homebrew is used only when no Node exists at all, so
+# a user's own broken install is never modified. Otherwise the official Node
+# LTS build, verified against nodejs.org's SHASUMS256.txt, goes into ~/.local.
+# Depends on $ARCH, so call this only after Preflight has set it.
 ensure_node() {
   hash -r 2>/dev/null || true
-  if command -v npm >/dev/null 2>&1 && command -v node >/dev/null 2>&1; then
-    ok "node: $(command -v node) · npm: $(command -v npm)"
+  if NODE_BIN="$(find_working_node)"; then
+    export PATH="$(dirname "$NODE_BIN"):$PATH"
+    ok "node $("$NODE_BIN" --version): $NODE_BIN · npm: $(dirname "$NODE_BIN")/npm"
     return 0
   fi
-  if command -v brew >/dev/null 2>&1; then
+  NODE_BIN=""
+  if command -v node >/dev/null 2>&1; then
+    warn "node at $(command -v node) does not run, lacks a working npm, or is older than v${NODE_MIN_MAJOR}"
+  elif command -v brew >/dev/null 2>&1; then
     warn "node/npm not found — installing via Homebrew…"
     # `</dev/null`: the installer is run as `curl … | bash`, so the script IS
     # stdin. A real `brew install` reads stdin during its fetch/first-run path
@@ -521,20 +604,25 @@ ensure_node() {
     # after this step. Detach stdin so brew can't eat the remaining commands.
     if brew install node </dev/null >/dev/null 2>&1; then
       hash -r 2>/dev/null || true
-      command -v npm >/dev/null 2>&1 && { ok "Node installed via Homebrew"; return 0; }
+      if NODE_BIN="$(find_working_node)"; then
+        export PATH="$(dirname "$NODE_BIN"):$PATH"
+        ok "Node installed via Homebrew → $NODE_BIN"
+        return 0
+      fi
     fi
+    NODE_BIN=""
     warn "Homebrew node install failed — falling back to the official Node build"
   fi
 
   # Official prebuilt Node from nodejs.org — no package manager required. The
   # dist filenames use x64/arm64, matching our $ARCH values.
-  local node_arch tmp url srcdir node_ver
+  local node_arch tmp url srcdir node_ver archive expected actual
   case "$ARCH" in
     arm64) node_arch="arm64" ;;
     x64)   node_arch="x64" ;;
     *) warn "cannot auto-install Node for arch $ARCH — install it from https://nodejs.org"; return 1 ;;
   esac
-  warn "node/npm not found — downloading the official Node LTS build…"
+  warn "downloading the official Node LTS build…"
   tmp="$(mktemp -d)"
   # index.json lists releases newest-first; the first entry whose "lts" is a
   # codename (not false) is the current LTS line. Derive its version and build
@@ -548,9 +636,17 @@ ensure_node() {
     warn "could not resolve the latest Node LTS version — install Node from https://nodejs.org"
     rm -rf "$tmp"; return 1
   fi
-  url="https://nodejs.org/dist/${node_ver}/node-${node_ver}-darwin-${node_arch}.tar.gz"
+  archive="node-${node_ver}-darwin-${node_arch}.tar.gz"
+  url="https://nodejs.org/dist/${node_ver}/${archive}"
   if ! curl -fL --connect-timeout 15 --speed-limit 1024 --speed-time 30 "$url" -o "$tmp/node.tar.gz"; then
     warn "Node download failed — install Node from https://nodejs.org"
+    rm -rf "$tmp"; return 1
+  fi
+  expected="$(curl -fsSL --connect-timeout 15 --max-time 30 "https://nodejs.org/dist/${node_ver}/SHASUMS256.txt" 2>/dev/null \
+    | awk -v f="$archive" '$2 == f { print $1; exit }' || true)"
+  actual="$(shasum -a 256 "$tmp/node.tar.gz" | awk '{print $1}')"
+  if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+    warn "Node download failed SHA-256 verification — install Node from https://nodejs.org"
     rm -rf "$tmp"; return 1
   fi
   if ! tar -xzf "$tmp/node.tar.gz" -C "$tmp"; then
@@ -568,13 +664,14 @@ ensure_node() {
   cp -R "$srcdir/include/." "$HOME/.local/include/" 2>/dev/null || true
   cp -R "$srcdir/share/." "$HOME/.local/share/" 2>/dev/null || true
   rm -rf "$tmp"
-  export PATH="$HOME/.local/bin:$PATH"
   hash -r 2>/dev/null || true
-  if command -v npm >/dev/null 2>&1; then
-    ok "Node installed → $(command -v node)"
+  if node_works "$HOME/.local/bin/node"; then
+    NODE_BIN="$HOME/.local/bin/node"
+    export PATH="$HOME/.local/bin:$PATH"
+    ok "Node installed → $NODE_BIN ($("$NODE_BIN" --version))"
     return 0
   fi
-  warn "Node install did not put npm on PATH — install Node from https://nodejs.org"
+  warn "the installed Node does not run — install Node from https://nodejs.org"
   return 1
 }
 
@@ -919,21 +1016,35 @@ else
 fi
 fi
 
-# ── Bun (required for Node deps + the bot) ──────────────
+# ── Bun (installs the support runtime's Node deps) ─────
 step "Bun"
-if command -v bun >/dev/null 2>&1; then
-  ok "bun: $(command -v bun)"
+if BUN_BIN="$(find_working_bun)"; then
+  ok "bun $("$BUN_BIN" --version 2>/dev/null): $BUN_BIN"
 else
-  warn "bun not found — installing…"
-  retry 3 bash -c 'curl -fsSL --connect-timeout 15 --max-time 60 https://bun.sh/install | bash' \
-    || die "bun install failed (could not download from bun.sh after 3 attempts — check your network, then re-run)"
-  export PATH="$HOME/.bun/bin:$PATH"
-  command -v bun >/dev/null 2>&1 && ok "bun installed" || die "bun still not on PATH — add \$HOME/.bun/bin to PATH, then re-run"
+  BUN_BIN=""
+  if command -v bun >/dev/null 2>&1; then
+    warn "bun at $(command -v bun) does not run or is older than ${BUN_MIN_MAJOR}.${BUN_MIN_MINOR} — installing a verified Bun…"
+  else
+    warn "bun not found — installing a verified Bun…"
+  fi
+  if ! install_verified_bun; then
+    warn "verified Bun download failed — trying the bun.sh installer…"
+    retry 3 bash -c 'curl -fsSL --connect-timeout 15 --max-time 60 https://bun.sh/install | bash' || true
+  fi
+  if bun_works "$HOME/.bun/bin/bun"; then
+    BUN_BIN="$HOME/.bun/bin/bun"
+    ok "bun installed: $BUN_BIN ($("$BUN_BIN" --version))"
+  else
+    warn "no working Bun — dependencies will be installed with npm instead"
+  fi
 fi
+[ -z "$BUN_BIN" ] || export PATH="$(dirname "$BUN_BIN"):$PATH"
 
 # ── Node.js + npm (runtime for MCP servers and npm-managed provider CLIs) ──
 step "Node.js"
 ensure_node || warn "continuing without Node — npm-managed provider CLIs and node-based MCP servers may be unavailable"
+[ -n "$BUN_BIN" ] || [ -n "$NODE_BIN" ] \
+  || die "neither a working Bun nor a working Node/npm is available — install Bun (https://bun.sh) or Node.js (https://nodejs.org), then re-run"
 
 # ── Delegate Node + Python deps + config to setup.command ─
 # setup.command (run from the data dir) installs Node deps via bun, installs the
@@ -949,6 +1060,8 @@ refresh_grok_cli_home
 ( cd "$DATA_DIR" && \
   CORTEX_RELEASE_INSTALL=1 \
   CORTEX_DATA_DIR="$DATA_DIR" \
+  CORTEX_SETUP_BUN_BIN="$BUN_BIN" \
+  CORTEX_SETUP_NODE_BIN="$NODE_BIN" \
   CORTEX_VOICE_TTS_BUNDLED_ASSET_DIR="$APP_PATH/Contents/Resources/standalone/scripts/voice-assets" \
   bash setup.command ) || die "setup.command failed; support runtime was not activated (see above)"
 restore_preserved_config_lines "$PRESERVED_CONFIG_BACKUP"
