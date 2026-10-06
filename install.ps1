@@ -256,10 +256,13 @@ function Test-PocketReleaseModel {
 
 # Refresh the current session's PATH from the registry so tools installed during
 # this run (Bun, Node, the CLIs) are found without restarting the shell.
+# Directories of the Bun/Node the installer proved working. Kept ahead of the
+# Machine PATH so a broken system-wide copy cannot win a later lookup.
+$script:RuntimePathPrefix = @()
 function Sync-Path {
   $machine = [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
   $user    = [System.Environment]::GetEnvironmentVariable('Path', 'User')
-  $env:Path = (@($machine, $user, "$env:USERPROFILE\.bun\bin") | Where-Object { $_ } ) -join ';'
+  $env:Path = (@($script:RuntimePathPrefix) + @($machine, $user, "$env:USERPROFILE\.bun\bin") | Where-Object { $_ } ) -join ';'
 }
 
 # The installer owns only its known vendor/npm locations. A user-selected
@@ -677,6 +680,106 @@ function Install-VerifiedBun {
   Ok "installed verified Bun $version"
 }
 
+# A Bun or Node that merely resolves on PATH can still be broken: built for the
+# other CPU, a truncated download, or too old for the support bundle's text
+# bun.lock. Run each candidate before trusting it. The probes avoid shell
+# metacharacters so a .cmd shim receives them intact.
+function Test-WorkingBun {
+  param([string]$Path)
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+  try {
+    # Require output only a running Bun can print: if the file cannot start as a
+    # process, PowerShell hands it to the shell instead and leaves a stale
+    # $LASTEXITCODE behind.
+    $out = & $Path -e "const v=Bun.version.split('.').map(Number);console.log(Math.sign(1002-(v[0]*1000+v[1]))===1?'cortex-runtime-old':'cortex-runtime-ok')" 2>$null
+    return (@($out) -contains 'cortex-runtime-ok')
+  } catch { return $false }
+}
+
+function Get-SiblingNpm {
+  param([string]$NodePath)
+  foreach ($name in @('npm.cmd', 'npm.exe')) {
+    $candidate = Join-Path (Split-Path -Parent $NodePath) $name
+    if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+  }
+  return $null
+}
+
+# Node >= 20 that runs JavaScript, with a working npm beside it.
+function Test-WorkingNode {
+  param([string]$Path)
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+  try {
+    $out = & $Path -e "console.log(Math.sign(20-Number(process.versions.node.split('.')[0]))===1?'cortex-runtime-old':'cortex-runtime-ok')" 2>$null
+    if (@($out) -notcontains 'cortex-runtime-ok') { return $false }
+    $npm = Get-SiblingNpm $Path
+    if (-not $npm) { return $false }
+    $npmVersion = & $npm --version 2>$null
+    return ([string](@($npmVersion) | Select-Object -Last 1) -match '^\d+\.\d+')
+  } catch { return $false }
+}
+
+# The first working candidate wins: every PATH entry, then the copies a
+# Cortex install manages.
+function Find-WorkingBun {
+  $candidates = @(Get-Command bun -All -CommandType Application -ErrorAction SilentlyContinue | ForEach-Object { $_.Source })
+  $candidates += Join-Path $env:USERPROFILE '.bun\bin\bun.exe'
+  foreach ($candidate in $candidates) { if (Test-WorkingBun $candidate) { return $candidate } }
+  return $null
+}
+
+$CORTEX_NODE_DIR = Join-Path $env:LOCALAPPDATA 'Programs\cortex-node'
+function Find-WorkingNode {
+  $candidates = @(Get-Command node -All -CommandType Application -ErrorAction SilentlyContinue | ForEach-Object { $_.Source })
+  $candidates += Join-Path $CORTEX_NODE_DIR 'node.exe'
+  if ($env:ProgramFiles) { $candidates += Join-Path $env:ProgramFiles 'nodejs\node.exe' }
+  foreach ($candidate in $candidates) { if (Test-WorkingNode $candidate) { return $candidate } }
+  return $null
+}
+
+function Add-UserPathEntry {
+  param([string]$Directory)
+  $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+  if (@($userPath -split ';') -notcontains $Directory) {
+    [Environment]::SetEnvironmentVariable('Path', (@($Directory, $userPath) | Where-Object { $_ }) -join ';', 'User')
+  }
+}
+
+# The official Node LTS zip, verified against nodejs.org's SHASUMS256.txt and
+# installed into a Cortex-owned directory, so a user's own Node is never touched.
+function Install-VerifiedNode {
+  $nodeArch = if ($ARCH -eq 'arm64') { 'arm64' } else { 'x64' }
+  $index = Invoke-RestMethod -Uri 'https://nodejs.org/dist/index.json' -TimeoutSec 30
+  $lts = @($index | Where-Object { $_.lts -and @($_.files) -contains "win-$nodeArch-zip" }) | Select-Object -First 1
+  if (-not $lts) { throw 'Could not resolve the current Node LTS release.' }
+  $name = "node-$($lts.version)-win-$nodeArch.zip"
+  $base = "https://nodejs.org/dist/$($lts.version)"
+  $sums = (Invoke-WebRequest -Uri "$base/SHASUMS256.txt" -UseBasicParsing -TimeoutSec 30).Content
+  if ($sums -is [byte[]]) { $sums = [Text.Encoding]::UTF8.GetString($sums) }
+  $expected = $null
+  foreach ($line in ($sums -split "`n")) {
+    if ($line -match "^([0-9a-fA-F]{64})\s+$([regex]::Escape($name))\s*$") { $expected = $Matches[1]; break }
+  }
+  if (-not $expected) { throw "nodejs.org publishes no SHA-256 for $name." }
+  $archive = Join-Path $WORK $name
+  Invoke-WebRequest -Uri "$base/$name" -OutFile $archive -UseBasicParsing
+  Assert-InstallerArtifact -Path $archive -ExpectedHash $expected
+  $stage = Join-Path $WORK 'node'
+  Expand-Archive -LiteralPath $archive -DestinationPath $stage -Force
+  $root = Join-Path $stage ($name -replace '\.zip$', '')
+  if (-not (Test-WorkingNode (Join-Path $root 'node.exe'))) { throw 'The downloaded Node does not run on this machine.' }
+  if (Test-Path -LiteralPath $CORTEX_NODE_DIR) { Remove-Item -LiteralPath $CORTEX_NODE_DIR -Recurse -Force }
+  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $CORTEX_NODE_DIR) | Out-Null
+  Copy-Item -LiteralPath $root -Destination $CORTEX_NODE_DIR -Recurse
+  # npm installs global CLIs into %APPDATA%\npm. The Node MSI puts that on PATH;
+  # the zip does not.
+  $npmGlobal = Join-Path $env:APPDATA 'npm'
+  New-Item -ItemType Directory -Force -Path $npmGlobal | Out-Null
+  Add-UserPathEntry $npmGlobal
+  Add-UserPathEntry $CORTEX_NODE_DIR
+  Ok "installed verified Node $($lts.version) -> $CORTEX_NODE_DIR"
+}
+
 function Remove-InstallerDuplicateSetupHook {
   param([Parameter(Mandatory = $true)][string]$Path)
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
@@ -913,31 +1016,57 @@ try {
   # the whole install (Bun also needs Windows 10 1809+, which not every box has).
   Step 'Bun'
   Sync-Path
-  if (Get-Command bun -ErrorAction SilentlyContinue) {
-    Ok "bun: $((Get-Command bun).Source)"
+  $script:BunBin = Find-WorkingBun
+  if ($script:BunBin) {
+    Ok "bun: $script:BunBin"
   } else {
-    Warn 'bun not found - installing...'
+    $brokenBun = (Get-Command bun -ErrorAction SilentlyContinue).Source
+    if ($brokenBun) { Warn "bun at $brokenBun does not run or is older than 1.2 - installing a verified Bun..." }
+    else { Warn 'bun not found - installing...' }
     try { Install-VerifiedBun }
     catch { Warn "verified Bun install failed: $($_.Exception.Message)" }
     Sync-Path
-    # Fall back to winget if the web installer didn't land bun on PATH.
-    if (-not (Get-Command bun -ErrorAction SilentlyContinue) -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+    $script:BunBin = Find-WorkingBun
+    # Fall back to winget if the verified download did not produce a working bun.
+    if (-not $script:BunBin -and (Get-Command winget -ErrorAction SilentlyContinue)) {
       Warn 'trying winget (Oven-sh.Bun)...'
       & winget install --id Oven-sh.Bun -e --silent --accept-source-agreements --accept-package-agreements 2>$null | Out-Null
       Sync-Path
+      $script:BunBin = Find-WorkingBun
     }
-    # The installer drops bun.exe under ~\.bun\bin even when PATH isn't refreshed
-    # in this session - pick it up directly before giving up.
-    $bunExe = Join-Path $env:USERPROFILE '.bun\bin\bun.exe'
-    if (-not (Get-Command bun -ErrorAction SilentlyContinue) -and (Test-Path $bunExe)) {
-      $env:Path = "$env:USERPROFILE\.bun\bin;$env:Path"
-    }
-    if (Get-Command bun -ErrorAction SilentlyContinue) {
-      Ok 'bun installed'
+    if ($script:BunBin) {
+      Ok "bun installed: $script:BunBin"
     } else {
-      Warn 'bun could not be installed (it needs Windows 10 1809+). The app still works; the WhatsApp bot needs bun - install it later from https://bun.sh.'
+      Warn 'no working Bun (it needs Windows 10 1809+). Dependencies will use npm instead; the WhatsApp bot needs bun - install it later from https://bun.sh.'
     }
   }
+
+  # -- Node.js + npm (MCP servers and npm-managed provider CLIs) ------------
+  Step 'Node.js'
+  $script:NodeBin = Find-WorkingNode
+  if ($script:NodeBin) {
+    Ok "node: $script:NodeBin"
+  } else {
+    $brokenNode = (Get-Command node -ErrorAction SilentlyContinue).Source
+    if ($brokenNode) { Warn "node at $brokenNode does not run, lacks a working npm, or is older than v20 - installing a verified Node LTS..." }
+    else { Warn 'node not found - installing a verified Node LTS...' }
+    try { Install-VerifiedNode }
+    catch { Warn "verified Node install failed: $($_.Exception.Message)" }
+    $script:NodeBin = Find-WorkingNode
+    if (-not $script:NodeBin -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+      Warn 'trying winget (OpenJS.NodeJS.LTS)...'
+      & winget install --id OpenJS.NodeJS.LTS -e --silent --accept-source-agreements --accept-package-agreements 2>$null | Out-Null
+      Sync-Path
+      $script:NodeBin = Find-WorkingNode
+    }
+    if ($script:NodeBin) { Ok "node installed: $script:NodeBin" }
+    else { Warn 'continuing without Node - npm-managed provider CLIs and node-based MCP servers may be unavailable. Install Node from https://nodejs.org.' }
+  }
+  $script:RuntimePathPrefix = @(@($script:BunBin, $script:NodeBin) | Where-Object { $_ } | ForEach-Object { Split-Path -Parent $_ })
+  Sync-Path
+  # setup.ps1 re-resolves its runtimes; hand it the ones proven above.
+  $env:CORTEX_SETUP_BUN_BIN = if ($script:BunBin) { $script:BunBin } else { '' }
+  $env:CORTEX_SETUP_NODE_BIN = if ($script:NodeBin) { $script:NodeBin } else { '' }
 
   # -- Dependencies (delegate to setup.ps1) ----------------------------------
   # setup.ps1 (shipped in the support bundle) installs Node deps via bun, the
@@ -964,7 +1093,8 @@ try {
   } else {
     Warn 'setup.ps1 not in support bundle - installing Node deps inline'
     Push-Location $DATA_DIR
-    try { & bun install } catch { Warn 'bun install failed' }
+    $bunCmd = if ($script:BunBin) { $script:BunBin } else { 'bun' }
+    try { & $bunCmd install } catch { Warn 'bun install failed' }
     Pop-Location
   }
   Restore-PreservedConfigLines -Path $CONFIG -Lines $preservedConfigBackup
@@ -1121,7 +1251,7 @@ try {
   # -- Computer-control MCP server ------------------------------------------
   Step 'Computer-control MCP server'
   $mcpServer = Join-Path $DATA_DIR 'scripts\computer-mcp\server.mjs'
-  $nodeCmd = (Get-Command node -ErrorAction SilentlyContinue).Source; if (-not $nodeCmd) { $nodeCmd = 'node' }
+  $nodeCmd = if ($script:NodeBin) { $script:NodeBin } else { (Get-Command node -ErrorAction SilentlyContinue).Source }; if (-not $nodeCmd) { $nodeCmd = 'node' }
   if (-not (Test-Path $mcpServer)) {
     Warn 'server.mjs not in support bundle - skipping computer-control selftest'
   } elseif (-not (Test-Path (Join-Path $DATA_DIR 'node_modules\@nut-tree-fork\nut-js'))) {
