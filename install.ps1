@@ -151,6 +151,22 @@ function Assert-InstallerArtifact {
   if ((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -ne $ExpectedHash) { throw "Downloaded file SHA-256 mismatch: $([IO.Path]::GetFileName($Path))" }
 }
 
+# Only the successful end of a standalone installation writes this receipt.
+# About can then distinguish an older abandoned updater from the current app.
+function Write-StandaloneInstallReceipt {
+  param([string]$VersionPath, [string]$Destination)
+  $version = Get-Content -LiteralPath $VersionPath -Raw | ConvertFrom-Json
+  if ([string]$version.tag -notmatch '^(?:[A-Za-z0-9]+-)?v?\d+(?:\.\d+)*$') { throw 'Installed build has no valid release tag.' }
+  $receipt = [ordered]@{ schemaVersion = 1; source = 'standalone-installer'; version = [string]$version.tag; completedAt = [DateTime]::UtcNow.ToString('o') }
+  $temporary = $Destination + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
+  try {
+    [IO.File]::WriteAllText($temporary, ($receipt | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $temporary -Destination $Destination -Force
+  } finally {
+    if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+  }
+}
+
 # -- Locate the release (skipped in local mode) ------------------------------
 $REL_JSON     = $null
 $SOURCE_REPO  = $PUBLIC_REPO
@@ -1331,6 +1347,11 @@ finally {
 }
 
 # -- Done --------------------------------------------------------------------
+if ($env:CORTEX_IN_APP_UPDATE -ne '1') {
+  try {
+    Write-StandaloneInstallReceipt -VersionPath (Join-Path $INSTALL_DIR 'resources\standalone\version.json') -Destination (Join-Path $DATA_DIR 'app-install-result.json')
+  } catch { Warn ("could not save standalone installation result: " + $_.Exception.Message) }
+}
 Write-Host ""
 Ok 'Install complete.'
 Write-Host ""
