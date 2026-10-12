@@ -173,6 +173,188 @@ installed_build_tag() {
   awk -F'"' '/"tag":[[:space:]]*"/ { print $4; exit }' "$vf"
 }
 
+# ── Claude sign-in diagnostics ──────────────────────────
+# Users report having to sign in to Claude again after an app update. These
+# probes record the shape of Claude's stored credential (never its value) at
+# each update phase, and a detached monitor records every change until a while
+# after the relaunch, so the log names the phase and the processes running when
+# the credential changed. Tokens are reduced to length plus an 8-hex SHA-256
+# fingerprint; the credential JSON travels only through pipes and shell
+# variables, never argv. Every probe is best-effort and must never fail or
+# noticeably slow the update. CORTEX_CLAUDE_AUTH_DIAG=0 disables them.
+claude_auth_diag_log() {
+  printf '%s' "${DATA_DIR:-$HOME/.cortex-ai-sessions}/claude-auth-diagnostics.log"
+}
+
+# Mirrors the CLI: CLAUDE_SECURESTORAGE_CONFIG_DIR (even empty) wins over
+# CLAUDE_CONFIG_DIR, and a non-empty scope suffixes the Keychain service.
+claude_auth_keychain_service() {
+  local scope="${CLAUDE_SECURESTORAGE_CONFIG_DIR-${CLAUDE_CONFIG_DIR:-}}"
+  if [ -n "$scope" ]; then
+    printf 'Claude Code-credentials-%s' "$(printf '%s' "$scope" | shasum -a 256 | cut -c1-8)"
+  else
+    printf 'Claude Code-credentials'
+  fi
+}
+
+# claude_auth_json_field <json> <key.path> — raw value, empty when absent.
+claude_auth_json_field() {
+  printf '%s' "$1" | plutil -extract "$2" raw -o - - 2>/dev/null | tr -d '\n'
+}
+
+# claude_auth_token_shape <json> <key.path> — "len/fingerprint", or "absent".
+claude_auth_token_shape() {
+  local value
+  value="$(claude_auth_json_field "$1" "$2")"
+  if [ -z "$value" ]; then printf 'absent'; return 0; fi
+  printf '%s/%s' "${#value}" "$(printf '%s' "$value" | shasum -a 256 | cut -c1-8)"
+}
+
+claude_auth_ms_to_date() {
+  case "$1" in
+    ''|*[!0-9]*) printf '%s' "${1:-absent}" ;;
+    0) printf '0 (cleared)' ;;
+    *) printf '%s (%s min from now)' "$(date -r "$(($1 / 1000))" '+%Y-%m-%d %H:%M:%S %z')" "$((($1 / 1000 - $(date +%s)) / 60))" ;;
+  esac
+}
+
+# claude_auth_credential_summary <json> — one secret-free line.
+claude_auth_credential_summary() {
+  local json="$1"
+  [ -n "$json" ] || { printf 'no credential JSON'; return 0; }
+  printf 'access=%s refresh=%s expiresAt=%s refreshExpiresAt=%s subscription=%s scopes=%s' \
+    "$(claude_auth_token_shape "$json" claudeAiOauth.accessToken)" \
+    "$(claude_auth_token_shape "$json" claudeAiOauth.refreshToken)" \
+    "$(claude_auth_ms_to_date "$(claude_auth_json_field "$json" claudeAiOauth.expiresAt)")" \
+    "$(claude_auth_ms_to_date "$(claude_auth_json_field "$json" claudeAiOauth.refreshTokenExpiresAt)")" \
+    "$(claude_auth_json_field "$json" claudeAiOauth.subscriptionType)" \
+    "$(printf '%s' "$json" | plutil -extract claudeAiOauth.scopes json -o - - 2>/dev/null | tr -d '\n')"
+}
+
+# claude_auth_with_timeout <seconds> <command...> — stdout only; kills a hang.
+claude_auth_with_timeout() {
+  local seconds="$1" pid watcher rc
+  shift
+  "$@" 2>/dev/null &
+  pid=$!
+  ( sleep "$seconds"; kill -9 "$pid" ) >/dev/null 2>&1 &
+  watcher=$!
+  wait "$pid"; rc=$?
+  kill "$watcher" >/dev/null 2>&1
+  wait "$watcher" 2>/dev/null
+  return "$rc"
+}
+
+# Cheap state used by the monitor to detect a change between snapshots.
+claude_auth_fingerprint() {
+  local svc json rc
+  svc="$(claude_auth_keychain_service)"
+  json="$(security find-generic-password -s "$svc" -w 2>/dev/null)"; rc=$?
+  printf 'keychain-rc=%s %s | %s | file=%s' "$rc" \
+    "$(security find-generic-password -s "$svc" 2>/dev/null | grep -E '"mdat"' | sed -E 's/.*"([0-9]{14}Z).*/mdat=\1/')" \
+    "$(claude_auth_credential_summary "$json" | sed -E 's/ \([-0-9]+ min from now\)//g')" \
+    "$(stat -f '%m' "$HOME/.claude/.credentials.json" 2>/dev/null || echo absent)"
+}
+
+claude_auth_snapshot_body() {
+  local phase="$1" svc meta json rc bin status_json file_json desktop
+  svc="$(claude_auth_keychain_service)"
+  printf '\n=== [%s] %s ===\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$phase"
+  printf 'installer: pid=%s app=%s release=%s installed=%s in-app-update=%s\n' \
+    "$$" "${APP_NAME:-?}" "${TAG:-?}" "$(installed_build_tag 2>/dev/null)" "${IN_APP_UPDATE:-0}"
+  printf 'env: CLAUDE_CONFIG_DIR=%s CLAUDE_SECURESTORAGE_CONFIG_DIR=%s ANTHROPIC_API_KEY=%s CLAUDE_CODE_OAUTH_TOKEN=%s ANTHROPIC_AUTH_TOKEN=%s\n' \
+    "${CLAUDE_CONFIG_DIR:-unset}" "${CLAUDE_SECURESTORAGE_CONFIG_DIR-unset}" \
+    "${ANTHROPIC_API_KEY:+set}" "${CLAUDE_CODE_OAUTH_TOKEN:+set}" "${ANTHROPIC_AUTH_TOKEN:+set}"
+
+  meta="$(security find-generic-password -s "$svc" 2>&1)"; rc=$?
+  printf 'keychain "%s": rc=%s %s\n' "$svc" "$rc" \
+    "$(printf '%s\n' "$meta" | grep -E '"(cdat|mdat)"' | sed -E 's/.*"(cdat|mdat)".*"([0-9]{14}Z).*/\1=\2/' | tr '\n' ' ')"
+  [ "$rc" -eq 0 ] || printf 'keychain error: %s\n' "$(printf '%s' "$meta" | tail -n 1)"
+  json="$(security find-generic-password -s "$svc" -w 2>/dev/null)"
+  printf 'keychain credential: %s\n' "$(claude_auth_credential_summary "$json")"
+
+  if [ -f "$HOME/.claude/.credentials.json" ]; then
+    file_json="$(cat "$HOME/.claude/.credentials.json" 2>/dev/null)"
+    printf 'credentials file: mtime=%s %s\n' "$(stat -f '%Sm' "$HOME/.claude/.credentials.json" 2>/dev/null)" \
+      "$(claude_auth_credential_summary "$file_json")"
+  else
+    printf 'credentials file: absent\n'
+  fi
+  if [ -f "$HOME/.claude.json" ]; then
+    printf '~/.claude.json: size=%s mtime=%s oauthAccount=%s\n' \
+      "$(stat -f '%z' "$HOME/.claude.json" 2>/dev/null)" "$(stat -f '%Sm' "$HOME/.claude.json" 2>/dev/null)" \
+      "$([ -n "$(plutil -extract oauthAccount.accountUuid raw -o - "$HOME/.claude.json" 2>/dev/null)" ] && echo present || echo absent)"
+  else
+    printf '~/.claude.json: absent\n'
+  fi
+  printf 'lock files: %s\n' "$( { find "$HOME/.claude" -maxdepth 1 -iname '*lock*' 2>/dev/null; ls -d "$HOME/.claude.json.lock" 2>/dev/null; } | tr '\n' ' ')"
+
+  bin="$(command -v claude 2>/dev/null)"
+  if [ -n "$bin" ]; then
+    printf 'claude: %s -> %s, %s\n' "$bin" "$(readlink "$bin" 2>/dev/null || echo '-')" \
+      "$(claude_auth_with_timeout 15 env DISABLE_AUTOUPDATER=1 "$bin" --version | head -n 1)"
+    # `auth status` reads stored credentials only; it never refreshes them.
+    status_json="$(claude_auth_with_timeout 15 env DISABLE_AUTOUPDATER=1 "$bin" auth status --json)"
+    printf 'claude auth status: loggedIn=%s authMethod=%s apiProvider=%s subscription=%s\n' \
+      "$(claude_auth_json_field "$status_json" loggedIn)" "$(claude_auth_json_field "$status_json" authMethod)" \
+      "$(claude_auth_json_field "$status_json" apiProvider)" "$(claude_auth_json_field "$status_json" subscriptionType)"
+  else
+    printf 'claude: not on PATH\n'
+  fi
+  printf 'installed CLI versions: %s\n' "$(ls "$HOME/.local/share/claude/versions" 2>/dev/null | tr '\n' ' ')"
+  desktop="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' /Applications/Claude.app/Contents/Info.plist 2>/dev/null)"
+  printf 'Claude Desktop: %s; bundled Claude Code: %s\n' "${desktop:-absent}" \
+    "$(ls "$HOME/Library/Application Support/Claude/claude-code" 2>/dev/null | tr '\n' ' ')"
+  # Executable paths only: full argv can carry prompt text.
+  printf 'processes (pid ppid elapsed executable):\n'
+  ps -axo pid=,ppid=,etime=,comm= 2>/dev/null \
+    | grep -iE 'claude|codex|cortex|w3i' \
+    | grep -vE 'grep|Helper|crashpad|ShipIt|disclaimer|chrome-native-host|ChatGPT for Chrome' \
+    | head -n 60 | sed 's/^/  /'
+}
+
+# claude_auth_snapshot <phase> — append one snapshot; never fails the caller.
+claude_auth_snapshot() {
+  [ "${CORTEX_CLAUDE_AUTH_DIAG:-1}" = "0" ] && return 0
+  local log body
+  log="$(claude_auth_diag_log)"
+  mkdir -p "$(dirname "$log")" 2>/dev/null || return 0
+  body="$( set +e +u +o pipefail; claude_auth_snapshot_body "$1" 2>&1 )" || true
+  # One append per snapshot so the monitor's entries never interleave with it.
+  printf '%s\n' "$body" >> "$log" 2>/dev/null || true
+  return 0
+}
+
+# Detached: snapshots every credential change for CORTEX_CLAUDE_AUTH_DIAG_SECONDS
+# (default 25 minutes), outliving the installer and the relaunch.
+start_claude_auth_monitor() {
+  [ "${CORTEX_CLAUDE_AUTH_DIAG:-1}" = "0" ] && return 0
+  local log seconds="${CORTEX_CLAUDE_AUTH_DIAG_SECONDS:-1500}"
+  log="$(claude_auth_diag_log)"
+  mkdir -p "$(dirname "$log")" 2>/dev/null || return 0
+  if [ "$(stat -f '%z' "$log" 2>/dev/null || echo 0)" -gt 2097152 ]; then
+    mv -f "$log" "$log.1" 2>/dev/null || true
+  fi
+  (
+    trap - EXIT
+    set +e +u +o pipefail
+    end=$((SECONDS + seconds))
+    last="$(claude_auth_fingerprint)"
+    printf '\n=== [%s] monitor started (pid %s, %ss): %s ===\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$(exec sh -c 'echo "$PPID"')" "$seconds" "$last" >> "$log"
+    while [ "$SECONDS" -lt "$end" ]; do
+      sleep 5
+      now="$(claude_auth_fingerprint)"
+      if [ "$now" != "$last" ]; then
+        claude_auth_snapshot "monitor: credential changed (was: $last)"
+        last="$now"
+      fi
+    done
+    claude_auth_snapshot "monitor finished"
+  ) </dev/null >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+  return 0
+}
+
 # Resolve the login-shell PATH so Bun/conda/pyenv are found even when this runs
 # piped from curl (a non-interactive, minimal-PATH shell). Mirrors setup.command.
 # -ilc sources rc files so PATH matches a real terminal, but those (and macOS
@@ -909,7 +1091,11 @@ ok "prepared app + support files"
 # ── Install the .app ────────────────────────────────────
 step "Installing ${APP_NAME}.app"
 [ "$IN_APP_UPDATE" = "1" ] && APP_RELAUNCH_REQUIRED=1
+start_claude_auth_monitor
+claude_auth_snapshot "before quitting the running app"
+ok "Claude sign-in diagnostics → $(claude_auth_diag_log)"
 quit_running_app
+claude_auth_snapshot "after quitting the running app"
 refresh_launchservices unregister
 # /Applications is writable by admins without sudo, but a locked bundle, a
 # managed (MDM) volume, or a non-admin account will block the swap. Check up
@@ -972,6 +1158,7 @@ if [ "$IN_APP_UPDATE" = "1" ]; then
   relaunch_installed_app \
     || warn "${APP_NAME} has not relaunched yet; the exit failsafe will retry"
 fi
+claude_auth_snapshot "after installing the app bundle and relaunch"
 
 # ── Pocket release model ───────────────────────────────
 # The model lives in an immutable, dedicated GitHub Release rather than inside
@@ -1424,11 +1611,13 @@ update_grok_cli() {
 # clears errexit inside it, so one vendor installer failing can never abort the
 # rest of the update (dependencies, voice runtime, relaunch failsafe).
 step "Provider CLI updates"
+claude_auth_snapshot "before provider CLI updates"
 run_guarded_cli_update claude update_claude_cli claude "Claude CLI"
 run_guarded_cli_update codex update_codex_cli codex "Codex CLI"
 run_guarded_cli_update antigravity update_agy_cli agy "Antigravity CLI"
 run_guarded_cli_update grok update_grok_cli grok "Grok CLI"
 release_cli_update_locks
+claude_auth_snapshot "after provider CLI updates"
 
 # ── Computer-control MCP server (mouse / keyboard / screen) ─
 # Cortex injects this MCP server per opted-in session. Do not register it at
@@ -1498,6 +1687,8 @@ else
   fi
 fi
 
+claude_auth_snapshot "after Claude MCP registration cleanup"
+
 # ── Google Chrome (WhatsApp bot via Puppeteer) ─
 # The WhatsApp bot needs Chrome for Puppeteer. Best-effort install via Homebrew
 # cask; warn if unavailable.
@@ -1518,6 +1709,7 @@ step "Other prerequisites (informational)"
   || warn "Claude Desktop not found — needed to read your claude.ai session."
 
 # ── Done ────────────────────────────────────────────────
+claude_auth_snapshot "install complete"
 echo
 ok "Install complete."
 echo
