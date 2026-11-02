@@ -7,7 +7,7 @@ installer and the prebuilt release artifacts (`Cortex-arm64.zip`,
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/appfactory123/cortex-ai-sessions-dist/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/thisiscortex/cortex-ai-sessions-dist/main/install.sh | bash
 ```
 
 Installs `Cortex.app` to `/Applications` and provisions `~/.cortex-ai-sessions`.
