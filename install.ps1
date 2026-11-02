@@ -38,8 +38,8 @@ $ProgressPreference = 'SilentlyContinue'   # hide Invoke-WebRequest's own progre
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
 
 # -- Config ------------------------------------------------------------------
-$REPO        = 'appfactory123/claude-sessions'
-$PUBLIC_REPO = if ($env:CORTEX_PUBLIC_REPO) { $env:CORTEX_PUBLIC_REPO } else { 'appfactory123/cortex-ai-sessions-dist' }
+$REPO        = 'thisiscortex/claude-sessions'
+$PUBLIC_REPO = if ($env:CORTEX_PUBLIC_REPO) { $env:CORTEX_PUBLIC_REPO } else { 'thisiscortex/cortex-ai-sessions-dist' }
 $APP_NAME    = 'Cortex'
 $APP_USER_MODEL_ID = 'com.local.cortex'
 $INSTALL_DIR = Join-Path $env:LOCALAPPDATA 'Programs\Cortex'
@@ -99,7 +99,7 @@ Ok "Windows / $ARCH"
 $APP_ZIP     = if ($installerProfile -and $ARCH -eq 'x64') { $installerProfile.release.windowsX64Artifact } else { "$APP_NAME-win-$ARCH.zip" }
 $SUPPORT_TAR = 'support.tar.gz'
 $POCKET_MODEL_ASSET = 'Pocket-English-model.tar.gz'
-$POCKET_MODEL_REPOSITORY = 'appfactory123/pocket-tts-model-weight-dist'
+$POCKET_MODEL_REPOSITORY = 'thisiscortex/pocket-tts-model-weight-dist'
 $POCKET_MODEL_RELEASE_TAG = 'pocket-tts-v2.1.0-english-1'
 $POCKET_MODEL_ARCHIVE_SHA256 = 'f860e83a96349ea3d7cae1be278cc13af45a88f4be65eab2157d0030bb089dea'
 $POCKET_MODEL_SHA256 = '473f47d99560bd50eb8b4509d3cacfe7f316ab20bdca86505403a2e6a936a6e9'
