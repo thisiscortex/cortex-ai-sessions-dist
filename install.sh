@@ -1223,6 +1223,27 @@ ditto "$WORK/support" "$DATA_DIR" || die "could not install the prepared support
 chmod +x "$DATA_DIR"/*.command "$DATA_DIR"/*.sh 2>/dev/null || true
 ok "extracted bot + support files"
 
+# Remove retired Qwen/private duplicate voice state during the upgrade itself,
+# before the new app can start and race the migration. The bundled helper is
+# generated from lib/voice/migrate-legacy-voice.ts, so installer and app startup
+# share one allowlist and marker contract. Failure is non-destructive and leaves
+# the marker absent; instrumentation retries on the next app launch.
+step "Legacy voice cleanup"
+LEGACY_VOICE_CLEANUP="$DATA_DIR/scripts/migrate-legacy-voice-runtime.mjs"
+PACKAGED_CLEANUP_NODE="$APP_PATH/Contents/Resources/appstore-node/bin/node"
+LEGACY_MODELS_LEDGER="${CORTEX_MODELS_LEDGER:-$HOME/.cortex-ai-sessions/models-ledger.json}"
+case "$LEGACY_MODELS_LEDGER" in /*) ;; *) LEGACY_MODELS_LEDGER="$HOME/.cortex-ai-sessions/models-ledger.json" ;; esac
+if [ -f "$LEGACY_VOICE_CLEANUP" ] && [ -x "$PACKAGED_CLEANUP_NODE" ]; then
+  if "$PACKAGED_CLEANUP_NODE" "$LEGACY_VOICE_CLEANUP" --apply --summary \
+    --data-dir "$DATA_DIR" --ledger-path "$LEGACY_MODELS_LEDGER"; then
+    ok "legacy voice state reconciled"
+  else
+    warn "legacy voice cleanup incomplete — Cortex will retry on next startup"
+  fi
+else
+  warn "legacy voice cleanup runtime unavailable — Cortex will retry on next startup"
+fi
+
 # The packaged app is self-contained. Bring the new UI back immediately after
 # the atomic bundle/support swap; the detached installer keeps running and the
 # relaunched app resumes progress from update.log while dependencies finish.

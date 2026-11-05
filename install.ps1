@@ -983,6 +983,28 @@ try {
     Remove-InstallerDuplicateSetupHook -Path (Join-Path $DATA_DIR 'package.json')
   }
 
+  # Reconcile retired Qwen/private duplicate voice state before the new app can
+  # launch. This generated Node entrypoint is bundled from the same domain
+  # module used by app startup; an incomplete run leaves its marker absent and
+  # startup retries without making the application install itself fail.
+  Step 'Legacy voice cleanup'
+  $legacyCleanup = Join-Path $DATA_DIR 'scripts\migrate-legacy-voice-runtime.mjs'
+  $cleanupNode = Join-Path $INSTALL_DIR 'resources\appstore-node\node.exe'
+  $legacyLedger = if ($env:CORTEX_MODELS_LEDGER -and [IO.Path]::IsPathRooted($env:CORTEX_MODELS_LEDGER)) {
+    [IO.Path]::GetFullPath($env:CORTEX_MODELS_LEDGER)
+  } else {
+    Join-Path $env:USERPROFILE '.cortex-ai-sessions\models-ledger.json'
+  }
+  if ((Test-Path -LiteralPath $legacyCleanup -PathType Leaf) -and (Test-Path -LiteralPath $cleanupNode -PathType Leaf)) {
+    try {
+      & $cleanupNode $legacyCleanup --apply --summary --data-dir $DATA_DIR --ledger-path $legacyLedger
+      if ($LASTEXITCODE -eq 0) { Ok 'legacy voice state reconciled' }
+      else { Warn 'legacy voice cleanup incomplete - Cortex will retry on next startup' }
+    } catch { Warn 'legacy voice cleanup could not run - Cortex will retry on next startup' }
+  } else {
+    Warn 'legacy voice cleanup runtime unavailable - Cortex will retry on next startup'
+  }
+
   # -- Pocket release model -------------------------------------------------
   # The model stays a distinct, versioned GitHub Release asset. It is not part
   # of the app archive or Git history; exact SHA-256 checks gate installation
